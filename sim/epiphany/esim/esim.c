@@ -781,29 +781,6 @@ es_mem_testset(es_state *esim, uint32_t addr, uint32_t size, uint8_t *dst)
   return es_tx_run(esim, &tx);
 }
 
-/*! Integer floored sqrt
- *
- * @param[in] n number
- *
- * @return Floored integer square root
- */
-static
-unsigned isqrt(unsigned n)
-{
-  unsigned low, mid, high;
-  low = 0;
-  high = n+1;
-  while (high-low > 1)
-    {
-      mid = (low+high) / 2;
-      if (mid*mid <= n)
-	low = mid;
-      else
-	high = mid;
-    }
-  return low;
-}
-
 /*! Validate cluster configuration
  *
  * @param[in] c Cluster configuration
@@ -829,7 +806,6 @@ es_validate_cluster_cfg(const es_cluster_cfg *c)
   FAIL_IF(!c->cols,         "Cols cannot be zero");
   FAIL_IF((cores != 1) && cores & 1,
 			    "Number of cores must be even (or exactly 1)");
-  FAIL_IF(cores % c->nodes, "Number of cores is not a multiple of nodes");
 
   FAIL_IF(c->col_base & 1,  "Col base must be even");
   FAIL_IF(c->row_base+c->rows > 64,
@@ -847,18 +823,10 @@ es_validate_cluster_cfg(const es_cluster_cfg *c)
   FAIL_IF(c->core_mem_region & (c->core_mem_region-1),
 			    "Core memory region size must be power of two");
 
-  /** @todo Revisit when we add net support */
-  FAIL_IF(c->nodes != 1,    "We currently only support one node.");
-
-
   FAIL_IF(c->ext_ram_size > ((size_t) (1UL<<32)),
 			    "External RAM size too large");
   FAIL_IF(c->ext_ram_size + ((size_t) c->ext_ram_base) > ((size_t) (1UL<<32)),
 			    "External RAM would overflow address space");
-
-  /* Ignore ext ram node if we don't have external ram */
-  FAIL_IF(c->ext_ram_size && c->ext_ram_node >= c->nodes,
-			    "Specified external ram node does not exist");
 
   FAIL_IF(c->ext_ram_size && (c->ext_ram_size & (c->core_mem_region-1)),
 			    "External ram size must be multiple of core mem"
@@ -907,7 +875,6 @@ es_validate_config(es_state *esim, es_node_cfg *node, es_cluster_cfg *cluster)
 
 /*! Calculate and fill in internal configuration values not specified by user.
  *
- * @todo This does not work when nodes != 1
  * @warning This must be called *after* es_validate_config
  *
  * @param[in]     esim     ESIM handle
@@ -918,35 +885,55 @@ static void
 es_fill_in_internal_cfg_values(es_state *esim, es_node_cfg *n,
 			       es_cluster_cfg *c)
 {
+  unsigned cols_per_node, rows_per_node;
+  float ratio, best_ratio;
+
+#if (!WITH_EMESH_NET) && !defined (ESIM_TEST)
+  /* Without networking there can be only one node */
+  c->nodes = 1;
+  c->ext_ram_node = 0;
+#endif
+
   /* Cluster settings */
   c->cores = c->rows * c->cols;
   c->cores_per_node = c->cores / c->nodes;
 
+  /* Calculate number of columns and rows per node.
+   * Optimize for most square-like configuration.
+   */
   if (c->nodes == 1)
     {
+      /* Trivial case */
       c->rows_per_node = c->rows;
       c->cols_per_node = c->cols;
     }
   else
     {
-      /* FIXME: The below code is not correct. */
+      best_ratio = ((float) (c->cols+1));
+      cols_per_node = min(c->cols, c->cores_per_node);
+      for (; cols_per_node >= 1; cols_per_node--)
+	{
+	  rows_per_node = c->cores_per_node / cols_per_node;
+	  ratio = ( max ( ((float)cols_per_node), ((float)rows_per_node) ) ) /
+		  ( min ( ((float)cols_per_node), ((float)rows_per_node) ) );
 
-      /* Calculate most square-like per node cluster layout as possible */
-      /** @todo User might want to specify different strategies, e.g., sequential.
-       * When we add MPI support this should be set in leader
-       * and then passed on to all other processes.
-       */
-      // node_cols = isqrt(nodes)
-      // node_rows = nodes/node_cols
-      c->rows_per_node = isqrt(c->cores_per_node);
-      if (c->rows_per_node > c->rows)
-	c->rows_per_node = c->rows;
-      while (c->cores_per_node % c->rows_per_node)
-	c->rows_per_node--;
+	  if (ratio >= best_ratio)
+	    break;
+	  if (c->cols % cols_per_node)
+	    continue;
+	  if (c->rows % rows_per_node)
+	    continue;
+	  if (c->cores_per_node % cols_per_node)
+	    continue;
+	  if ((rows_per_node * c->nodes * cols_per_node) / c->cols != c->rows)
+	    continue;
 
-      c->cols_per_node = c->cores_per_node / c->rows_per_node;
+	  /* Found better candidate */
+	  best_ratio = ratio;
+	  c->cols_per_node = cols_per_node;
+	  c->rows_per_node = rows_per_node;
+	}
     }
-
 
   /* Node settings */
   n->row_base = c->row_base + (c->cores_per_node * n->rank) / c->cols;
