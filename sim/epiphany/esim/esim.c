@@ -40,17 +40,11 @@
 
 /*@todo rename es_tx_one_* to something better */
 
-#if 0
-/** @todo define in config.h */
-/* #define HAVE_MPI2 */
-#define HAVE_MPI2_ACC_REPLACE
-#endif
 
 /* Need these for correct cpu struct */
 #define WANT_CPU epiphanybf
 #define WANT_CPU_EPIPHANYBF
 
-#include "esim.h"
 #include "sim-main.h"
 #include "mem-barrier.h"
 
@@ -61,7 +55,6 @@
 /** @todo Standard errnos should be sufficient for now */
 /* Errors are returned as negative numbers. */
 #include <errno.h>
-
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -76,183 +69,8 @@
 
 #include <pthread.h>
 
-#define max(a,b) \
-   ({ __typeof__ (a) _a = (a); \
-       __typeof__ (b) _b = (b); \
-     _a > _b ? _a : _b; })
-
-#define min(a,b) \
-   ({ __typeof__ (a) _a = (a); \
-       __typeof__ (b) _b = (b); \
-     _a < _b ? _a : _b; })
-
-/* openmpi-x86 should be set in include flag */
-//#include <openmpi-x86_64/mpi.h>
-
-
-#define ES_SHM_CORE_STATE_HEADER_SIZE 4096 /*!< Per core state header size.
-					     Should be plenty */
-
-#define ES_SHM_CORE_STATE_SIZE (1024*1024) /*!< Per core state size (1 MB) */
-#define ES_SHM_CONFIG_SIZE     (1024*1024) /*!< Reserved for shm header (1 MB)*/
-
-#define ES_CORE_MMR_BASE 0xf0000 /*!< Offset for memory mapped registers */
-#define ES_CORE_MMR_SIZE 2048    /*!< MMR region size */
-
-#define ES_EPIPHANY_NUM_GPRS  64 /*!< Number of general purpose registers */
-
-#define ES_CAS_DEF(S) \
-static inline uint##S##_t \
-es_cas##S (uint##S##_t *ptr, uint##S##_t oldval, uint ##S##_t newval) \
-{ \
-  return __sync_val_compare_and_swap (ptr, oldval, newval); \
-} \
-
-ES_CAS_DEF(8)
-ES_CAS_DEF(16)
-ES_CAS_DEF(32)
-ES_CAS_DEF(64)
-#undef ES_CAS_DEF
-
-#define ES_ATOMIC_INCR_DEF(S) \
-static inline uint##S##_t \
-es_atomic_incr##S(uint##S##_t *ptr) \
-{ \
-  return __sync_fetch_and_add (ptr, 1); \
-} \
-
-ES_ATOMIC_INCR_DEF(8)
-ES_ATOMIC_INCR_DEF(16)
-ES_ATOMIC_INCR_DEF(32)
-ES_ATOMIC_INCR_DEF(64)
-#undef ES_ATOMIC_INC_DEF
-
-#define ES_NODE_CFG (esim->shm->node_cfg)
-#define ES_CLUSTER_CFG (esim->shm->cluster_cfg)
-
-/** @todo These needs to be more general if we want allow larger than 1MB per-core
- * address space
- */
-
-#define ES_CORES_PER_ROW (1<<6)
-
-#define ES_CORE_ROW(coreid) ((coreid)>>6)
-#define ES_CORE_COL(coreid) ((coreid) & ((1<<6)-1))
-
-#define ES_COREID(row, col) (((row)<<6)+(col))
-
-#define ES_ADDR_TO_CORE(addr) ((addr) / ES_CLUSTER_CFG.core_mem_region)
-
-#define ES_ADDR_CORE_OFFSET(addr) ((addr) % ES_CLUSTER_CFG.core_mem_region)
-
-#define ES_ADDR_IS_GLOBAL(addr) \
- ((addr) >= ES_CLUSTER_CFG.core_mem_region)
-
-#define ES_ADDR_TO_GLOBAL(addr) \
- (ES_ADDR_IS_GLOBAL((addr)) ? (addr) : \
-  ((addr) + esim->coreid * ES_CLUSTER_CFG.core_mem_region))
-
-#define ES_ADDR_IS_EXT_RAM(addr) \
- ((ES_CLUSTER_CFG.ext_ram_base <= (addr) && \
-   (addr) < ES_CLUSTER_CFG.ext_ram_base + ES_CLUSTER_CFG.ext_ram_size))
-
-#define ES_ADDR_IS_MMR(addr) \
- (!(ES_ADDR_IS_EXT_RAM((addr))) && \
-  (ES_CORE_MMR_BASE <= ES_ADDR_CORE_OFFSET((addr)) && \
-   ES_ADDR_CORE_OFFSET((addr)) < ES_CORE_MMR_BASE+ES_CORE_MMR_SIZE))
-
-/*! ESIM configuration header in shared memory */
-typedef struct es_shm_header_ {
-    uint8_t           initialized;         /*!< True if creator has initialized
-					        other members in this struct */
-    uint32_t          node_core_sims_ready;/*!< Atomic increment             */
-    es_cluster_cfg    cluster_cfg;         /*!< Cluster configuration        */
-    es_node_cfg       node_cfg;            /*!< Node configuration           */
-    pthread_barrier_t run_barrier;         /*!< Start barrier                */
-    pthread_barrier_t exit_barrier;        /*!< Exit barrier                 */
-} es_shm_header;
-
-/*! ESIM per core state header (in SHM) */
-typedef struct es_shm_core_state_header_ {
-  uint32_t reserved; /*!< Set to one if reserved by a sim process */
-} es_shm_core_state_header;
-
-
-/*! ESIM per process state */
-typedef struct es_state_ {
-    unsigned initialized;                  /*!< Set by es_init on success */
-    uint8_t ready;                         /*!< True when sim process is
-					        ready                        */
-    unsigned coreid;                       /*!< Coreid of sim process        */
-    int fd;                                /*!< Shared memory file descriptor*/
-    unsigned creator;                      /*!< True if process created shm
-					        file                         */
-    char shm_name[256];                    /*!< Name of shm file             */
-    size_t shm_size;                       /*!< Size of shm file             */
-
-    volatile es_shm_header *shm;           /*!< Pointer to shm config header */
-    volatile uint8_t *cores_mem;           /*!< Base address for core mem
-				    	        (and core state)             */
-    volatile uint8_t *this_core_mem;       /*!< Ptr to this cores mem region */
-    volatile es_shm_core_state_header
-        *this_core_state_header;           /*!< Ptr to core state header     */
-    volatile uint8_t *this_core_cpu_state; /*!< GDB sim_cpu struct           */
-    volatile uint8_t *ext_ram;             /*!< Ptr to external RAM          */
-} es_state;
-
-
-
-/*! Where in simulator an Epiphany address resides */
-typedef enum es_loc_t_ {
-  /** @todo might need ES_LOC_UNALIGNED */
-  ES_LOC_INVALID=0, /*!< Invalid memory address */
-  ES_LOC_SHM,       /*!< Core SRAM (in SHM */
-  ES_LOC_SHM_MMR,   /*!< MMR region (in SHM) */
-  ES_LOC_RAM,       /*!< External RAM (in SHM) */
-  ES_LOC_NET,       /*!< Core SRAM (other node) */
-  ES_LOC_NET_MMR,   /*!< MMR region (other node). Maybe we don't need this  */
-  ES_LOC_NET_RAM    /*!< External RAM (other node) */
-} es_loc_t;
-
-/*! Type of memory request */
-typedef enum es_req_t {
-  ES_REQ_LOAD,
-  ES_REQ_STORE,
-  ES_REQ_TESTSET,
-} es_req_t;
-
-/*! Address translation */
-typedef struct es_transl_ {
-  es_loc_t	location;  /*!< Location (local shm or network) and type */
-  uint32_t	addr;      /*!< Epiphany address */
-  size_t	in_region; /*!< Num of bytes left in region, need better name */
-  unsigned	coreid;    /*!< Core (if any) address belongs to */
-  unsigned	node;      /*!< Node address belongs to */
-  uint8_t	*mem;      /*!< Native pointer into shm region */
-  sim_cpu       *cpu;      /*!< Pointer to 'remote' sim cpu    */
-  unsigned      reg;       /*!< If memory mapped register      */
-
-  /*! If requested address was global before translation, needed by TESTSET */
-  unsigned      addr_was_global;
-#if 0
-#ifdef HAVE_MPI2
-  MPI_AInt  mpi_offset;
-#endif
-#endif
-} es_transl;
-
-#define ES_TRANSL_INIT {ES_LOC_INVALID, 0, 0, 0, 0, NULL, NULL, 0, 0}
-
-/*! Transaction unit */
-typedef struct es_transaction_ {
-  es_req_t	type;       /*!< Type of request */
-  uint8_t	*target;    /*!< Pointer to target buffer */
-  uint32_t	addr;       /*!< Target (Epiphany) base address */
-  uint32_t	size;       /*!< Total number of bytes requested */
-  uint32_t	remaining;  /*!< Remaining bytes in transaction */
-  es_transl	sim_addr;   /*!< Address translation of current region */
-} es_transaction;
-
+#include "esim.h"
+#include "esim-int.h"
 
 /*! Get core index in shared memory
  *
@@ -301,8 +119,8 @@ es_shm_core_base(const es_state *esim, unsigned coreid)
 static signed
 es_addr_to_node(const es_state *esim, uint32_t addr)
 {
-  unsigned coreid, node;
-  signed row_offset, col_offset;
+  unsigned coreid;
+  signed row_offset, col_offset, node;
 
   if (ES_ADDR_IS_EXT_RAM(addr))
     {
@@ -349,6 +167,7 @@ static void
 es_addr_translate(const es_state *esim, es_transl *transl, uint32_t addr)
 {
   uint8_t *tmp_ptr;
+  signed node;
 
   if (es_initialized(esim) != ES_OK)
     {
@@ -362,8 +181,15 @@ es_addr_translate(const es_state *esim, es_transl *transl, uint32_t addr)
 
   addr = ES_ADDR_TO_GLOBAL(addr);
   transl->addr = addr;
-  transl->node = es_addr_to_node(esim, addr);
+  if ((node = es_addr_to_node(esim, addr)) < 0)
+    {
+      transl->location = ES_LOC_INVALID;
+      return;
+    }
+  transl->node = node;
+
   transl->coreid = ES_ADDR_TO_CORE(addr);
+
   if (transl->node == ES_NODE_CFG.rank)
     {
       if (ES_ADDR_IS_EXT_RAM(addr))
@@ -418,11 +244,12 @@ es_addr_translate(const es_state *esim, es_transl *transl, uint32_t addr)
 	    }
 	}
     }
-  else
+  else /* if (transl->node != ES_NODE_CFG.rank) */
     {
+#if WITH_EMESH_NET
+      es_net_addr_translate(esim, transl, addr);
+#else
       transl->location = ES_LOC_INVALID;
-#ifdef ES_DEBUG
-  fprintf(stderr, "es_addr_translate: net not implemented\n");
 #endif
     }
 #ifdef ES_DEBUG
@@ -450,7 +277,7 @@ static int
 es_tx_one_shm_load(es_state *esim, es_transaction *tx)
 {
   size_t n = min(tx->remaining, tx->sim_addr.in_region);
-  memcpy(tx->target, tx->sim_addr.mem, n);
+  memmove(tx->target, tx->sim_addr.mem, n);
   tx->target += n;
   tx->remaining -= n;
 
@@ -471,7 +298,7 @@ es_tx_one_shm_store(es_state *esim, es_transaction *tx)
 {
   uint32_t i, invalidate;
   size_t n = min(tx->remaining, tx->sim_addr.in_region);
-  memcpy(tx->sim_addr.mem, tx->target, n);
+  memmove(tx->sim_addr.mem, tx->target, n);
   tx->target += n;
   tx->remaining -= n;
   if (tx->sim_addr.coreid == esim->coreid && esim->this_core_cpu_state)
@@ -569,7 +396,7 @@ es_tx_one_shm_testset(es_state *esim, es_transaction *tx)
  *
  * @return ES_OK on success
  */
-static int
+int
 es_tx_one_shm_mmr(es_state *esim, es_transaction *tx)
 {
   int reg, n;
@@ -616,6 +443,8 @@ es_tx_one_shm_mmr(es_state *esim, es_transaction *tx)
       epiphanybf_h_all_registers_set(current_cpu, reg, *target);
       n = 4;
       break;
+    /*! @todo Implement (if supported by hardware?) */
+    /* case ES_REQ_TESTSET: */
     default:
       n = -EINVAL;
     }
@@ -666,14 +495,13 @@ es_tx_one(es_state *esim, es_transaction *tx)
       return es_tx_one_shm_mmr(esim, tx);
       break;
 
+#if WITH_EMESH_NET
     case ES_LOC_NET:
     case ES_LOC_NET_MMR:
-
-#ifdef ES_DEBUG
-      fprintf(stderr, "es_tx_one: access method not implemented\n");
-#endif
-      return -EINVAL;
+    case ES_LOC_NET_RAM:
+      return es_net_tx_one(esim, tx);
       break;
+#endif
 
     default:
 #ifdef ES_DEBUG
@@ -705,7 +533,7 @@ es_tx_run(es_state *esim, es_transaction *tx)
   while (1)
     {
       ret = es_tx_one(esim, tx);
-      if (ret || !tx->remaining)
+      if (ret != ES_OK || !tx->remaining)
 	break;
       es_addr_translate_next_region(esim, &tx->sim_addr);
     }
@@ -836,6 +664,9 @@ es_validate_cluster_cfg(const es_cluster_cfg *c)
 			    "External ram base must be aligned to core mem"
 			    " region size.");
 
+  /** @todo Require external RAM to be on node 0 for now */
+  FAIL_IF(c->ext_ram_node != 0,
+			    "External RAM must reside on node 0");
 
   /* WARN: This only works with 1M core mem region size */
   if (c->ext_ram_size)
@@ -856,23 +687,6 @@ es_validate_cluster_cfg(const es_cluster_cfg *c)
   return ES_OK;
 }
 
-/*! Validate node and cluster configuration
- *
- * @param[in] esim     ESIM handle
- * @param[in] node     Node configuration
- * @param[in] cluster  Cluster configuration
- *
- * @return ES_OK on success
- */
-static int
-es_validate_config(es_state *esim, es_node_cfg *node, es_cluster_cfg *cluster)
-{
-  /** @todo Revisit when we have network/MPI support.
-   * We might have to also validate node config 
-   */
-  return es_validate_cluster_cfg(cluster);
-}
-
 /*! Calculate and fill in internal configuration values not specified by user.
  *
  * @warning This must be called *after* es_validate_config
@@ -882,62 +696,83 @@ es_validate_config(es_state *esim, es_node_cfg *node, es_cluster_cfg *cluster)
  * @param[in,out] cluster  Cluster configuration
  */
 static void
-es_fill_in_internal_cfg_values(es_state *esim, es_node_cfg *n,
-			       es_cluster_cfg *c)
+es_fill_in_internal_cfg_values(es_state *esim)
 {
   unsigned cols_per_node, rows_per_node;
   float ratio, best_ratio;
 
 #if (!WITH_EMESH_NET) && !defined (ESIM_TEST)
   /* Without networking there can be only one node */
-  c->nodes = 1;
-  c->ext_ram_node = 0;
+  ES_CLUSTER_CFG.nodes = 1;
+  ES_CLUSTER_CFG.ext_ram_node = 0;
 #endif
 
   /* Cluster settings */
-  c->cores = c->rows * c->cols;
-  c->cores_per_node = c->cores / c->nodes;
+  ES_CLUSTER_CFG.cores = ES_CLUSTER_CFG.rows * ES_CLUSTER_CFG.cols;
+  ES_CLUSTER_CFG.cores_per_node = ES_CLUSTER_CFG.cores / ES_CLUSTER_CFG.nodes;
 
   /* Calculate number of columns and rows per node.
    * Optimize for most square-like configuration.
    */
-  if (c->nodes == 1)
+  if (ES_CLUSTER_CFG.nodes == 1)
     {
       /* Trivial case */
-      c->rows_per_node = c->rows;
-      c->cols_per_node = c->cols;
+      ES_CLUSTER_CFG.rows_per_node = ES_CLUSTER_CFG.rows;
+      ES_CLUSTER_CFG.cols_per_node = ES_CLUSTER_CFG.cols;
     }
   else
     {
-      best_ratio = ((float) (c->cols+1));
-      cols_per_node = min(c->cols, c->cores_per_node);
+      ES_CLUSTER_CFG.cols_per_node = 0;
+      ES_CLUSTER_CFG.rows_per_node = 0;
+
+      /* Initialize with value worse than worst case */
+      best_ratio =
+       (float) (1 + max (ES_CLUSTER_CFG.cols, ES_CLUSTER_CFG.rows));
+
+      cols_per_node = min(ES_CLUSTER_CFG.cols, ES_CLUSTER_CFG.cores_per_node);
       for (; cols_per_node >= 1; cols_per_node--)
 	{
-	  rows_per_node = c->cores_per_node / cols_per_node;
+	  rows_per_node = ES_CLUSTER_CFG.cores_per_node / cols_per_node;
 	  ratio = ( max ( ((float)cols_per_node), ((float)rows_per_node) ) ) /
 		  ( min ( ((float)cols_per_node), ((float)rows_per_node) ) );
 
 	  if (ratio >= best_ratio)
 	    break;
-	  if (c->cols % cols_per_node)
+	  if (ES_CLUSTER_CFG.cols % cols_per_node)
 	    continue;
-	  if (c->rows % rows_per_node)
+	  if (ES_CLUSTER_CFG.rows % rows_per_node)
 	    continue;
-	  if (c->cores_per_node % cols_per_node)
+	  if (ES_CLUSTER_CFG.cores_per_node % cols_per_node)
 	    continue;
-	  if ((rows_per_node * c->nodes * cols_per_node) / c->cols != c->rows)
+	  if ((rows_per_node * ES_CLUSTER_CFG.nodes * cols_per_node) /
+	      ES_CLUSTER_CFG.cols != ES_CLUSTER_CFG.rows)
 	    continue;
 
 	  /* Found better candidate */
 	  best_ratio = ratio;
-	  c->cols_per_node = cols_per_node;
-	  c->rows_per_node = rows_per_node;
+	  ES_CLUSTER_CFG.cols_per_node = cols_per_node;
+	  ES_CLUSTER_CFG.rows_per_node = rows_per_node;
 	}
     }
 
   /* Node settings */
-  n->row_base = c->row_base + (c->cores_per_node * n->rank) / c->cols;
-  n->col_base = c->col_base + (c->cols_per_node  * n->rank) % c->cols;
+#if WITH_EMESH_NET
+  ES_NODE_CFG.rank = esim->net.rank / ES_CLUSTER_CFG.cores_per_node;
+  ES_CLUSTER_CFG.ext_ram_rank =
+    ES_CLUSTER_CFG.ext_ram_node * ES_CLUSTER_CFG.cores_per_node;
+#else
+  ES_NODE_CFG.rank = 0;
+  ES_CLUSTER_CFG.ext_ram_rank = 0;
+#endif
+
+  {
+    unsigned node_row =
+     (ES_NODE_CFG.rank * ES_CLUSTER_CFG.cols_per_node) / ES_CLUSTER_CFG.cols;
+    ES_NODE_CFG.row_base = ES_CLUSTER_CFG.row_base +
+      (ES_CLUSTER_CFG.rows_per_node * node_row);
+    ES_NODE_CFG.col_base = ES_CLUSTER_CFG.col_base +
+      (ES_CLUSTER_CFG.cols_per_node  * ES_NODE_CFG.rank) % ES_CLUSTER_CFG.cols;
+  }
 }
 
 /*! Open ESIM shared memory file
@@ -1007,17 +842,18 @@ es_open_shm_file(es_state *esim, char *name, struct flock *flock)
 static int
 es_truncate_shm_file(es_state *esim, es_node_cfg *n, es_cluster_cfg *c)
 {
-  size_t size;
-  /* MMAP size */
-  size = ES_SHM_CONFIG_SIZE +
-   (c->rows_per_node*c->cols_per_node) *
-   (c->core_mem_region+ES_SHM_CORE_STATE_SIZE);
+  size_t size, per_core, cores;
 
-  /* Should we also allocate space for external ram? */
-  if (c->ext_ram_node == n->rank)
-    {
-      size += c->ext_ram_size;
-    }
+  /* Calculate MMAP file size. */
+#if WITH_EMESH_NET
+  /* This function is called before es_net_init(), so we don't know how many
+   * nodes there are in the cluster. Assume worst case (1 node) and allocate
+   * memory for all cores + external RAM.
+   */
+#endif
+  cores = c->rows * c->cols;
+  per_core = c->core_mem_region + ES_SHM_CORE_STATE_SIZE;
+  size = ES_SHM_CONFIG_SIZE + (cores * per_core) + c->ext_ram_size;
 
   if (ftruncate(esim->fd, size) == -1)
     {
@@ -1080,16 +916,16 @@ es_state_reset(es_state *esim)
 
 /*! Initialize esim
  *
- * @param[in,out] esim     pointer to ESIM handle
- * @param[in]     node     Node configuration
- * @param[in]     cluster  Cluster configuration
+ * @param[in,out] esim          pointer to ESIM handle
+ * @param[in]     cluster       Cluster configuration
+ * @param[in]     coreid_hint   Coreid hint (not used w. esim-net)
  *
  * @return On success returns ES_OK and sets handle to allocated
  *         esim structure. On error returns a negative error number and sets
  *         handle to NULL.
  */
 int
-es_init(es_state **handle, es_node_cfg node, es_cluster_cfg cluster)
+es_init(es_state **handle, es_cluster_cfg cluster, unsigned coreid_hint)
 {
   /** @todo Revisit once we have MPI support
    * Cluster cfg should be set in leader (rank0) and then passed to all other
@@ -1097,6 +933,7 @@ es_init(es_state **handle, es_node_cfg node, es_cluster_cfg cluster)
    */
   int error;
   char shm_name[256];
+  es_node_cfg node;
   es_state *esim;
   volatile es_shm_header *shm;
   unsigned msecs_wait;
@@ -1133,12 +970,10 @@ es_init(es_state **handle, es_node_cfg node, es_cluster_cfg cluster)
   /* If this process created the file, set its size */
   if (esim->creator)
     {
-      if ((error = es_validate_config(esim, &node, &cluster)) != ES_OK)
+      if ((error = es_validate_cluster_cfg(&cluster)) != ES_OK)
 	{
 	  goto err_out;
 	}
-
-      es_fill_in_internal_cfg_values(esim, &node, &cluster);
 
       if ((error = es_truncate_shm_file(esim, &node, &cluster)) != ES_OK)
 	{
@@ -1181,18 +1016,51 @@ es_init(es_state **handle, es_node_cfg node, es_cluster_cfg cluster)
   if (esim->creator)
     {
       /* Copy over cluster and node config structs to shared memory */
-      memcpy((void *) &ES_CLUSTER_CFG, (void *) &cluster,
+      memmove((void *) &ES_CLUSTER_CFG, (void *) &cluster,
 	     sizeof(es_cluster_cfg));
-      memcpy((void *) &ES_NODE_CFG, (void *) &node,
+      memmove((void *) &ES_NODE_CFG, (void *) &node,
 	     sizeof(es_node_cfg));
 
-      /* Initialize pthread barriers */
+      /* Signal waiting processes that shared memory is ready */
+      shm->shm_initialized = 1;
+    }
+  else /* if (!creator) */
+    {
+      /* Busy wait for creating process */
+      msecs_wait = 0;
+      while (!shm->shm_initialized && msecs_wait <= 3000)
+	{
+	  usleep(5000);
+	  msecs_wait += 5;
+	}
+      if (!shm->shm_initialized)
+	{
+	  fprintf(stderr, "ESIM: Timed out waiting on shared memory.\n");
+	  error = -ETIME;
+	  goto err_out;
+	}
+    }
+
+#if WITH_EMESH_NET
+  /* We use a shared counter to calculate how many sim processes there are on
+     every node. Therefore we cannot do this before we have SHM. */
+  if ((error = es_net_init(esim)) != ES_OK)
+    goto err_out;
+#endif
+
+  if (esim->creator)
+    {
+      es_fill_in_internal_cfg_values(esim);
+
+      /** @todo Determine what to do with this edge-case and WITH_EMESH_NET. */
       have_core_0 = (!ES_NODE_CFG.col_base && !ES_NODE_CFG.row_base);
+
       /* Coreid 0 is invalid so we should not wait for it */
       sim_processes = have_core_0 ?
 	ES_CLUSTER_CFG.cores_per_node-1 :
 	ES_CLUSTER_CFG.cores_per_node;
 
+      /* Initialize pthread barriers */
       pthread_barrierattr_init(&attr);
       pthread_barrierattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
       pthread_barrier_init(
@@ -1203,33 +1071,67 @@ es_init(es_state **handle, es_node_cfg node, es_cluster_cfg cluster)
 	  sim_processes);
       pthread_barrierattr_destroy(&attr);
 
-      /* Signal waiting processes creating (this) process is done */
-      shm->initialized = 1;
+      /* Signal waiting processes that (shared) configuration is ready */
+      shm->cfg_initialized = 1;
     }
   else /* if (!creator) */
     {
       /* Busy wait for creating process */
-      while (!shm->initialized && msecs_wait <= 3000)
+      msecs_wait = 0;
+      while (!shm->cfg_initialized && msecs_wait <= 3000)
 	{
 	  usleep(5000);
 	  msecs_wait += 5;
 	}
-      if (!shm->initialized)
+      if (!shm->cfg_initialized)
 	{
-	  fprintf(stderr, "ESIM: Timed out waiting.\n");
+	  fprintf(stderr, "ESIM: Timed out waiting on config.\n");
 	  error = -ETIME;
 	  goto err_out;
 	}
-
     }
 
   /* If external RAM is on this node, set up pointer */
   if (ES_CLUSTER_CFG.ext_ram_node == ES_NODE_CFG.rank)
     {
       esim->ext_ram = ((uint8_t *) shm) + ES_SHM_CONFIG_SIZE +
-	ES_CLUSTER_CFG.cores_per_node *
+	ES_CLUSTER_CFG.cores *
 	  (ES_CLUSTER_CFG.core_mem_region + ES_SHM_CORE_STATE_SIZE);
     }
+
+#if WITH_EMESH_NET
+  /* Calculate coreid from MPI rank */
+  if ((error = es_net_set_coreid_from_rank(esim)) != ES_OK)
+    {
+      fprintf(stderr, "ESIM: Could not set coreid.\n");
+      goto err_out;
+    }
+  /* Need coreid and this_core_cpu_state */
+  if ((error = es_net_init_mmr(esim)) != ES_OK)
+    {
+      goto err_out;
+    }
+  /* Now when coreid is set, we can expose SRAM to other processes */
+  if ((error = es_net_init_mpi_win(esim)) != ES_OK)
+    {
+      goto err_out;
+    }
+#else
+  /* Set coreid from hint */
+  if ((error = es_set_coreid(esim, coreid_hint)) != ES_OK)
+    {
+      if (error == -EADDRINUSE)
+	{
+	  fprintf(stderr, "ESIM: Could not set coreid to `%u'. Already "
+		  "reserved by another simulator process\n", coreid_hint);
+	}
+      else
+	{
+	  fprintf(stderr, "ESIM: Could not set coreid to `%u'.\n", coreid_hint);
+	}
+      goto err_out;
+    }
+#endif
 
 #ifdef ES_DEBUG
   fprintf(stderr,
@@ -1238,12 +1140,13 @@ es_init(es_state **handle, es_node_cfg node, es_cluster_cfg cluster)
 	  esim->coreid, esim->shm_name);
 #endif
 
+ok_out:
   esim->initialized = 1;
   *handle = esim;
   return ES_OK;
 
 err_out:
-  es_cleanup(esim);
+  es_fini(esim);
   return error;
 }
 
@@ -1266,14 +1169,18 @@ es_initialized(const es_state* esim)
  * @param[in,out] esim     ESIM handle
  */
 void
-es_cleanup(es_state *esim)
+es_fini(es_state *esim)
 {
 #ifdef ES_DEBUG
-  fprintf(stderr, "es_cleanup\n");
+  fprintf(stderr, "es_fini\n");
 #endif
 
   if (!esim)
     return;
+
+#if WITH_EMESH_NET
+  es_net_fini(esim);
+#endif
 
   if (esim->shm)
     munmap((void *) esim->shm, esim->shm_size);
@@ -1310,12 +1217,13 @@ es_set_ready(es_state *esim)
 void
 es_wait_run(es_state *esim)
 {
-  /** @todo Before this, leader process (the one that created shm file should wait
-     for network and then set condition variable all other local cores watch.
-   */
-
   /** @todo Would be nice to support Ctrl-C here */
+
+#if WITH_EMESH_NET
+  es_net_wait_run(esim);
+#else
   pthread_barrier_wait((pthread_barrier_t *) &esim->shm->run_barrier);
+#endif
   es_set_ready(esim);
 }
 
@@ -1327,13 +1235,15 @@ void
 es_wait_exit(es_state *esim)
 {
   /** @todo Would be nice to support Ctrl-C here */
+
+#if WITH_EMESH_NET
+  es_net_wait_exit(esim);
+#else
   if (esim->ready)
     {
       pthread_barrier_wait((pthread_barrier_t *) &esim->shm->exit_barrier);
     }
-  /** @todo After this, leader process (the one that created shm file should wait
-     for network and then set condition variable all other local cores watch.
-   */
+#endif
 }
 
 /*! Check whether a given core-id is valid for current configuration
@@ -1359,6 +1269,9 @@ es_valid_coreid(const es_state *esim, unsigned coreid)
 
 /*! Set coreid for this sim process
  *
+ * Set coreid for this sim process
+ * This can be done at most once.
+ *
  * @param[in,out] esim     ESIM handle
  * @param[in]     coreid   Coreid
  *
@@ -1367,36 +1280,30 @@ es_valid_coreid(const es_state *esim, unsigned coreid)
 int
 es_set_coreid(es_state *esim, unsigned coreid)
 {
-  volatile uint8_t *new_cpu_state;
-  es_shm_core_state_header *new_hdr, *old_hdr;
+  es_shm_core_state_header *header;
+  int rc;
 
+  /* Verify that coreid was not already set */
+  if (esim->coreid != 0)
+    return -EINVAL;
 
   if (es_valid_coreid(esim, coreid) != ES_OK)
     return -EINVAL;
 
-  if (coreid == esim->coreid)
-    return ES_OK;
+  header = (es_shm_core_state_header *) es_shm_core_base(esim, coreid);
 
-  new_hdr = (es_shm_core_state_header *) es_shm_core_base(esim, coreid);
-
-  if (!new_hdr)
+  if (!header)
     return -EINVAL;
 
-  if (es_cas32(&new_hdr->reserved, 0, 1))
-    return -EINVAL;
-
-  new_cpu_state = es_shm_core_base(esim, coreid) +
-   ES_SHM_CORE_STATE_HEADER_SIZE;
-
-  old_hdr = (es_shm_core_state_header *) es_shm_core_base(esim, esim->coreid);
-  if (old_hdr)
-    old_hdr->reserved = 0;
+  if (es_cas32(&header->reserved, 0, 1))
+    return -EADDRINUSE;
 
   esim->coreid = coreid;
 
-  esim->this_core_state_header = (es_shm_core_state_header *) new_hdr;
-  esim->this_core_cpu_state = new_cpu_state;
-  esim->this_core_mem = (uint8_t *) new_hdr + ES_SHM_CORE_STATE_SIZE;
+  esim->this_core_state_header = (es_shm_core_state_header *) header;
+  esim->this_core_cpu_state = es_shm_core_base(esim, coreid) +
+			      ES_SHM_CORE_STATE_HEADER_SIZE;
+  esim->this_core_mem = (uint8_t *) header + ES_SHM_CORE_STATE_SIZE;
 
   return ES_OK;
 }
@@ -1421,7 +1328,7 @@ es_set_cpu_state(es_state *esim, void *cpu, size_t size)
 
   memset((void *)esim->this_core_cpu_state, 0,
 	 ES_SHM_CORE_STATE_SIZE - ES_SHM_CORE_STATE_HEADER_SIZE);
-  memcpy((void *)esim->this_core_cpu_state, cpu, size);
+  memmove((void *)esim->this_core_cpu_state, cpu, size);
 
   return esim->this_core_cpu_state;
 }
@@ -1443,11 +1350,12 @@ es_dump_config(const es_state *esim)
 	  "  .ext_ram_node    = %d\n"
 	  "  .ext_ram_base    = 0x%.8x\n"
 	  "  .ext_ram_size    = %zu\n"
-	  "  .nodes           = %d\n"
 	  "  .cores           = %d\n"
+	  "  .nodes           = %d\n"
 	  "  .cores_per_node  = %d\n"
 	  "  .rows_per_node   = %d\n"
 	  "  .cols_per_node   = %d\n"
+	  "  .ext_ram_rank    = %d\n"
 	  "}\n",
 	  ES_CLUSTER_CFG.row_base,
 	  ES_CLUSTER_CFG.col_base,
@@ -1457,11 +1365,12 @@ es_dump_config(const es_state *esim)
 	  ES_CLUSTER_CFG.ext_ram_node,
 	  ES_CLUSTER_CFG.ext_ram_base,
 	  ES_CLUSTER_CFG.ext_ram_size,
-	  ES_CLUSTER_CFG.nodes,
 	  ES_CLUSTER_CFG.cores,
+	  ES_CLUSTER_CFG.nodes,
 	  ES_CLUSTER_CFG.cores_per_node,
 	  ES_CLUSTER_CFG.rows_per_node,
-	  ES_CLUSTER_CFG.cols_per_node);
+	  ES_CLUSTER_CFG.cols_per_node,
+	  ES_CLUSTER_CFG.ext_ram_rank);
   fprintf(stderr,
 	  "es_node_cfg = {\n"
 	  "  .rank     = %d\n"
@@ -1473,31 +1382,33 @@ es_dump_config(const es_state *esim)
 	  ES_NODE_CFG.col_base);
   fprintf(stderr,
 	  ".esim = {\n"
-	  ".ready                  = %d\n"
-	  ".shm                    = 0x%p\n"
-	  ".shm_name               = %s\n"
-	  ".shm_size               = %lu\n"
-	  ".cores_mem              = 0x%p\n"
-	  ".this_core_mem          = 0x%p\n"
-	  ".this_core_state_header = 0x%p\n"
-	  ".this_core_cpu_state    = 0x%p\n"
-	  ".ext_ram                = 0x%p\n"
-	  ".coreid                 = %d\n"
-	  ".fd                     = %d\n"
-	  ".creator                = %d\n"
+	  "  .initialized            = %d\n"
+	  "  .ready                  = %d\n"
+	  "  .coreid                 = %d\n"
+	  "  .fd                     = %d\n"
+	  "  .creator                = %d\n"
+	  "  .shm_name               = %s\n"
+	  "  .shm_size               = %lu\n"
+	  "  .shm                    = 0x%p\n"
+	  "  .cores_mem              = 0x%p\n"
+	  "  .this_core_mem          = 0x%p\n"
+	  "  .this_core_state_header = 0x%p\n"
+	  "  .this_core_cpu_state    = 0x%p\n"
+	  "  .ext_ram                = 0x%p\n"
 	  "}\n",
+	  esim->initialized,
 	  esim->ready,
-	  esim->shm,
+	  esim->coreid,
+	  esim->fd,
+	  esim->creator,
 	  esim->shm_name,
 	  esim->shm_size,
+	  esim->shm,
 	  esim->cores_mem,
 	  esim->this_core_mem,
 	  esim->this_core_state_header,
 	  esim->this_core_cpu_state,
-	  esim->ext_ram,
-	  esim->coreid,
-	  esim->fd,
-	  esim->creator);
+	  esim->ext_ram);
 }
 
 inline size_t

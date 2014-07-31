@@ -58,29 +58,28 @@ typedef struct es_cluster_cfg_ {
     uint32_t ext_ram_base;            /*!< core_mem_region must be divisor */
     size_t   ext_ram_size;            /*!< Size of external memory         */
 
+    /*! @privatesection */
     /* Keep your grubby little mitts off of these plz :) */
+    /* Filled in by es_fill_in_internal_cfg_values() */
     unsigned cores;                   /*!< Total number of cores           */
-    unsigned nodes;                   /*!< Number of simulation nodes      */
-    unsigned cores_per_node;          /*!< Cores per node                  */
+    unsigned nodes;                   /*!< Number of simulation nodes.
+                                        Computed by es_net_init if networking
+                                        is enabled */
+    unsigned cores_per_node;          /*!< Cores per node
+                                        Computed by es_net_init if networking
+                                        is enabled */
     unsigned rows_per_node;           /*!< Rows per node                   */
     unsigned cols_per_node;           /*!< Columns per node                */
+
+    unsigned ext_ram_rank;            /*!< Rank of process w. ext ram      */
 } es_cluster_cfg;
-
-/*! ESIM node configuration */
-typedef struct es_node_cfg_ {
-    unsigned rank; /*!< == lowest mpi rank on node / nodes */
-
-    /* Keep your grubby little mitts off of these plz :) */
-    unsigned row_base; /*!< Upper leftmost row in this node */
-    unsigned col_base; /*!< Upper leftmost col in this node */
-} es_node_cfg;
 
 typedef struct es_state_ es_state;
 
 /* API functions */
 
-int es_init(es_state **esim, es_node_cfg node, es_cluster_cfg cluster);
-void es_cleanup(es_state *esim);
+int es_init(es_state **esim, es_cluster_cfg cluster, unsigned coreid);
+void es_fini(es_state *esim);
 
 int es_mem_store(es_state *esim, uint32_t addr, uint32_t size, uint8_t *src);
 int es_mem_load(es_state *esim, uint32_t addr, uint32_t size, uint8_t *dst);
@@ -93,7 +92,6 @@ void es_wait_exit(es_state *esim);
 int es_valid_coreid(const es_state *esim, unsigned coreid);
 int es_initialized(const es_state* esim);
 
-int es_set_coreid(es_state *esim, unsigned coreid);
 unsigned es_get_coreid(const es_state *esim);
 
 volatile void *es_set_cpu_state(es_state *esim, void* cpu, size_t size);

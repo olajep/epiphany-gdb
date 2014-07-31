@@ -69,7 +69,7 @@ typedef enum {
   E_OPTION_EXT_RAM_BASE,
   E_OPTION_EXT_RAM_SIZE,
   /** @todo Add more options:
-   * Check es_cluster_cfg and es_node_cfg in emesh.h
+   * Check es_cluster_cfg in esim.h
    */
 } EPIPHANY_OPTIONS;
 
@@ -94,8 +94,7 @@ static void print_epiphany_misc_cpu (SIM_CPU *cpu, int verbose);
 static SIM_RC epiphany_option_handler (SIM_DESC, sim_cpu *, int, char *, int);
 
 #ifdef WITH_EMESH_SIM
-static SIM_RC sim_esim_cpu_relocate (SIM_DESC sd, int extra_bytes,
-				     unsigned new_coreid);
+static SIM_RC sim_esim_cpu_relocate (SIM_DESC sd, int extra_bytes);
 static SIM_RC sim_esim_set_options(SIM_DESC sd, sim_cpu *cpu);
 static SIM_RC sim_esim_init(SIM_DESC sd);
 #endif
@@ -113,9 +112,13 @@ static const OPTION options_epiphany[] =
       '\0', "FILE", "Epiphany XML hardware description file",
       epiphany_option_handler },
 #endif
+#if WITH_EMESH_NET
+  /* coreid is determined from MPI rank */
+#else
   { {"e-coreid", required_argument, NULL, E_OPTION_COREID},
       '\0', "COREID", "Set coreid",
       epiphany_option_handler  },
+#endif
   { {"e-cols", required_argument, NULL, E_OPTION_NUM_COLS},
       '\0', "n", "Number of core columns",
       epiphany_option_handler  },
@@ -141,7 +144,7 @@ free_state (SIM_DESC sd)
   if (STATE_MODULES (sd) != NULL)
     sim_module_uninstall (sd);
 #if WITH_EMESH_SIM
-  es_cleanup(STATE_ESIM(sd));
+  es_fini(STATE_ESIM(sd));
 #else
   sim_cpu_free_all (sd);
 #endif
@@ -235,28 +238,10 @@ epiphany_option_handler (SIM_DESC sd, sim_cpu *cpu, int opt, char *arg,
 #if WITH_EMESH_SIM
 /* Custom sim cpu alloc for emesh sim */
 SIM_RC
-sim_esim_cpu_relocate (SIM_DESC sd, int extra_bytes, unsigned new_coreid)
+sim_esim_cpu_relocate (SIM_DESC sd, int extra_bytes)
 {
   static unsigned freed = 0; /* Original sim_cpu struct is malloced */
   sim_cpu *new_cpu;
-
-  if (es_valid_coreid(STATE_ESIM(sd), new_coreid) != ES_OK)
-    {
-      sim_io_eprintf(sd, "Invalid coreid `0x%x'.\n", new_coreid);
-      return SIM_RC_FAIL;
-    }
-
-  if (es_get_coreid(STATE_ESIM(sd)) == new_coreid)
-    return SIM_RC_OK;
-
-  if (es_set_coreid(STATE_ESIM(sd), new_coreid) != ES_OK)
-    {
-      sim_io_eprintf (sd, "Could not set coreid to `0x%x'. Perhaps it was "
-		      "already reserved by another sim process.\n",
-		      new_coreid);
-      return SIM_RC_FAIL;
-    }
-
 
   if (! (new_cpu = es_set_cpu_state(STATE_ESIM(sd), STATE_CPU(sd, 0),
 			sizeof(sim_cpu) + extra_bytes)))
@@ -290,12 +275,16 @@ static SIM_RC sim_esim_have_required_params(SIM_DESC sd)
       return SIM_RC_FAIL;\
     }
 
+#if WITH_EMESH_NET
+  /* Coreid is determined by MPI RANK */
+#else
   /* If there is only one core, we know first coreid */
   if (emesh_params.coreid < 0 &&
       emesh_params.num_rows == 1 && emesh_params.num_cols == 1)
     emesh_params.coreid = emesh_params.first_coreid;
 
   FAIL_IF(0 > emesh_params.coreid      , "--e-coreid not set");
+#endif
 
   /* Either use hardware definition file or other params */
   if (emesh_params.xml_hdf_file != NULL)
@@ -394,11 +383,10 @@ err_out:
 
 static SIM_RC sim_esim_init(SIM_DESC sd)
 {
-  /** @todo Of course this shouldn't be hard coded */
   es_cluster_cfg cluster;
-  es_node_cfg node;
+  struct emesh_params *p;
 
-  struct emesh_params *p = &emesh_params;
+  p = &emesh_params;
 
   uint64_t ext_ram_size = 32*1024*1024;
   uint64_t ext_ram_base = 0x8e000000;
@@ -415,11 +403,8 @@ static SIM_RC sim_esim_init(SIM_DESC sd)
     }
 #endif
 
-  memset(&node, 0, sizeof(node));
   memset(&cluster, 0, sizeof(cluster));
 
-  node.rank = 0;
-  cluster.nodes = 1;
   cluster.col_base = p->first_coreid & ((1 << 6) -1);
   cluster.row_base = p->first_coreid >> 6;
   cluster.cols = p->num_cols;
@@ -440,13 +425,12 @@ static SIM_RC sim_esim_init(SIM_DESC sd)
   cluster.ext_ram_base = ext_ram_base;
   cluster.ext_ram_node = 0;
 
-  if (es_init(&STATE_ESIM(sd), node, cluster))
+  if (es_init(&STATE_ESIM(sd), cluster, p->coreid) != ES_OK)
     {
       return SIM_RC_FAIL;
     }
 
-  if (sim_esim_cpu_relocate (sd, cgen_cpu_max_extra_bytes (),
-			     emesh_params.coreid) != SIM_RC_OK)
+  if (sim_esim_cpu_relocate (sd, cgen_cpu_max_extra_bytes ()) != SIM_RC_OK)
     {
       return SIM_RC_FAIL;
     }
@@ -642,11 +626,11 @@ sim_close (sd, quitting)
   epiphany_cgen_cpu_close (CPU_CPU_DESC (STATE_CPU (sd, 0)));
 #if WITH_EMESH_SIM
   if (es_initialized(STATE_ESIM(sd)) == ES_OK)
-      {
-	sim_io_eprintf(sd, "ESIM: Waiting for other cores...");
-	es_wait_exit(STATE_ESIM(sd));
-	sim_io_eprintf(sd, " done.\n");
-      }
+    {
+      sim_io_eprintf(sd, "ESIM: Waiting for other cores...");
+      es_wait_exit(STATE_ESIM(sd));
+      sim_io_eprintf(sd, " done.\n");
+    }
 #endif
   sim_module_uninstall (sd);
   free_state(sd);

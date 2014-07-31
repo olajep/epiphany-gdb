@@ -23,10 +23,12 @@ EPIPHANY_OBJS = epiphany.o cpu.o decode.o sem.o model.o mloop.o epiphany-fp.o \
 
 SIM_EXTRA_LIBS = -lm @epiphany_extra_libs@
 
+ESIM_OBJS =
 ifeq (@esim@, yes)
-	ESIM_OBJS = esim/esim.o
-else
-	ESIM_OBJS =
+	ESIM_OBJS += esim/esim.o
+endif
+ifeq (@esim_net@, yes)
+	ESIM_OBJS += esim/esim-net.o
 endif
 
 SIM_OBJS = \
@@ -118,8 +120,8 @@ epiphany-clean:
 	rm -f mloop.c eng.h stamp-mloop
 	rm -f tmp-*
 	rm -f stamp-arch stamp-cpu
-	rm -r esim/stamp-esim esim/*.o
-	rm -r esim/test/stamp-esim-test $(ESIM_TEST_OBJS) $(ESIM_TEST_BINS)
+	rm -f esim/stamp-esim esim/*.o
+	rm -f esim/test/stamp-esim-test $(ESIM_TEST_OBJS) $(ESIM_TEST_BINS)
 
 # cgen support, enable with --enable-cgen-maint
 CGEN_MAINT = ; @true
